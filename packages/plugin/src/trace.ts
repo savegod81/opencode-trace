@@ -1,11 +1,4 @@
-import type {
-  Plugin,
-  PluginModule,
-  Hooks,
-  PluginInput,
-  Config as PluginConfig,
-} from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin";
+import type { Plugin, Hooks, PluginInput } from "@opencode-ai/plugin";
 import type { Event, Session, Part } from "@opencode-ai/sdk";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -67,6 +60,49 @@ function formatStatus(instance: TracePlugin, sessionId?: string): string {
   return lines.join("\n");
 }
 
+function normalizeEvent(event: any): Record<string, any> {
+  const raw = event ?? {};
+  const properties = raw.properties ?? raw.data ?? raw.payload ?? {};
+
+  return {
+    ...raw,
+    type: raw.type ?? raw.eventType ?? raw.name ?? "unknown",
+    properties,
+  };
+}
+
+function normalizeSessionFromEvent(event: any): Session | null {
+  const raw = normalizeEvent(event);
+  const props = raw.properties ?? {};
+
+  const candidates = [
+    props.info,
+    props.session,
+    props.data?.info,
+    props.data?.session,
+    props.metadata,
+    props.record,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object") {
+      return candidate as Session;
+    }
+  }
+
+  return null;
+}
+
+function normalizeToolContext(input: any): Record<string, any> {
+  const raw = input ?? {};
+  return {
+    tool: raw.tool ?? raw.name ?? raw.toolName ?? "",
+    sessionId: raw.sessionId ?? raw.session_id ?? raw.sessionID ?? raw.session?.id ?? "",
+    callId: raw.callId ?? raw.call_id ?? raw.callID ?? raw.id ?? "",
+    args: raw.args ?? raw.arguments ?? raw.params ?? {},
+  };
+}
+
 const plugin: Plugin = async (input: PluginInput) => {
   const globalDir = join(homedir(), ".opencode-trace");
   const localDir = join(input.directory, ".opencode-trace");
@@ -80,19 +116,18 @@ const plugin: Plugin = async (input: PluginInput) => {
   }
 
   testPlugin = instance;
-
   const client = input.client;
 
   const hooks: Hooks = {
-    event: async ({ event }: { event: Event }) => {
+    event: async ({ event }: { event: Event | any }) => {
       if (!instance.getStateManager()) return;
 
-      if (
-        event.type === "session.created" ||
-        event.type === "session.updated"
-      ) {
-        const session = (event.properties as { info: Session }).info;
+      const normalized = normalizeEvent(event);
+      const session = normalizeSessionFromEvent(normalized);
+      const eventType = normalized.type;
 
+      if (eventType === "session.created" || eventType === "session.updated") {
+        if (!session) return;
         if (!instance.shouldRecord(session.id)) return;
 
         const existing = instance.getStateManager()!.getSession(session.id);
@@ -107,90 +142,80 @@ const plugin: Plugin = async (input: PluginInput) => {
         });
 
         if (session.parentID) {
-          instance
-            .getStateManager()!
-            .addSubSession(session.parentID, session.id);
+          instance.getStateManager()!.addSubSession(session.parentID, session.id);
         }
       }
     },
 
-    "tool.execute.after": async (
-      input: { tool: string; sessionId: string; callId: string; args: unknown },
-      output: { title: string; output: string; metadata: unknown },
-    ) => {
+    "tool.execute.after": async (input: any, output: any) => {
       if (!instance.getStateManager()) return;
 
-      if (input.tool === "task") {
-        const metadata = output.metadata as Record<string, unknown> | undefined;
-        if (metadata && typeof metadata.session_id === "string") {
+      const normalizedInput = normalizeToolContext(input);
+      if (normalizedInput.tool === "task") {
+        const metadata = (output?.metadata ?? output?.result ?? {}) as Record<string, unknown>;
+        const sessionId = typeof metadata.session_id === "string" ? metadata.session_id : undefined;
+        if (sessionId && normalizedInput.sessionId) {
           const sm = instance.getStateManager()!;
-          sm.addSubSession(input.sessionId, metadata.session_id as string);
-          sm.updateSessionMetadata(metadata.session_id as string, {
-            parentID: input.sessionId,
+          sm.addSubSession(normalizedInput.sessionId, sessionId);
+          sm.updateSessionMetadata(sessionId, {
+            parentID: normalizedInput.sessionId,
           });
         }
       }
     },
 
-    "chat.message": async (
-      input: { sessionId: string; agent?: string; messageId?: string; variant?: string },
-      _output: { message: import("@opencode-ai/sdk").UserMessage; parts: Part[] },
-    ) => {
+    "chat.message": async (input: any, _output: any) => {
       if (!instance.getStateManager()) return;
       logger.info("chat.message", {
-        sessionId: input.sessionId,
-        messageId: input.messageId,
-        agent: input.agent,
-        variant: input.variant,
+        sessionId: input?.sessionId ?? input?.session_id,
+        messageId: input?.messageId ?? input?.message_id,
+        agent: input?.agent,
+        variant: input?.variant,
       });
     },
 
-    "chat.params": async (
-      input: { sessionId: string; agent: string; model: unknown; provider: unknown; message: unknown },
-      _output: unknown,
-    ) => {
+    "chat.params": async (input: any, _output: unknown) => {
       if (!instance.getStateManager()) return;
       logger.info("chat.params", {
-        sessionId: input.sessionId,
-        agent: input.agent,
-        model: input.model,
+        sessionId: input?.sessionId ?? input?.session_id,
+        agent: input?.agent,
+        model: input?.model,
       });
     },
 
-    "tool.execute.before": async (
-      input: { tool: string; sessionId: string; callId: string },
-      _output: { args: unknown },
-    ) => {
+    "tool.execute.before": async (input: any, _output: any) => {
       if (!instance.getStateManager()) return;
       logger.info("tool.execute.before", {
-        sessionId: input.sessionId,
-        callId: input.callId,
-        tool: input.tool,
+        sessionId: input?.sessionId ?? input?.session_id,
+        callId: input?.callId ?? input?.call_id,
+        tool: input?.tool ?? input?.name,
       });
     },
 
-    config: async (input: PluginConfig) => {
-      input.command = input.command ?? {};
-      input.command["trace"] = {
+    config: async (input: any) => {
+      const commandMap = input.command ?? input.commands ?? {};
+      commandMap["trace"] = {
         template: "",
         description: "Control trace recording: /trace <on|off|status> [-g] [-l] [-s] [-d global|local]",
       };
+      input.command = commandMap;
+      input.commands = commandMap;
     },
 
-    "command.execute.before": async (
-      input: { command: string; sessionId: string; arguments: string },
-      _output: { parts: Part[] },
-    ) => {
-      if (input.command !== "trace") return;
+    "command.execute.before": async (input: any, _output: { parts: Part[] }) => {
+      const commandName = input?.command ?? input?.name ?? "";
+      if (commandName !== "trace") return;
       if (!instance.getStateManager()) return;
 
-      const tokens = input.arguments.split(/\s+/).filter(Boolean);
+      const rawArgs = input?.arguments ?? input?.args ?? "";
+      const tokens = String(rawArgs).split(/\s+/).filter(Boolean);
       const cmd = tokens[0]?.toLowerCase();
       const hasGlobal = tokens.includes("-g") || tokens.includes("--global");
       const hasLocal = tokens.includes("-l") || tokens.includes("--local");
       const hasSession = tokens.includes("-s") || tokens.includes("--session");
       const dirIndex = tokens.findIndex((t) => t === "-d" || t === "--dir");
       const dir = dirIndex >= 0 ? tokens[dirIndex + 1]?.toLowerCase() : undefined;
+      const sessionId = input?.sessionId ?? input?.session_id ?? "";
 
       let result = "";
       try {
@@ -217,11 +242,13 @@ const plugin: Plugin = async (input: PluginInput) => {
         } else if (cmd === "on" || cmd === "enable") {
           const targetDir = dir ?? "global";
           const enabled: string[] = [];
+
           if (hasGlobal || !(hasLocal || hasSession)) {
             sm.setGlobalState("global_trace_enabled", "true");
             sm.setGlobalState("storage_preference", targetDir);
             enabled.push("global");
           }
+
           if (hasLocal) {
             if (!localCmd) {
               result = "Local config not available";
@@ -230,20 +257,24 @@ const plugin: Plugin = async (input: PluginInput) => {
               enabled.push("local");
             }
           }
-          if (hasSession) {
-            sm.setSessionEnabled(input.sessionId, true);
-            if (dir) sm.setSessionStoragePreference(input.sessionId, dir as "global" | "local");
+
+          if (hasSession && sessionId) {
+            sm.setSessionEnabled(sessionId, true);
+            if (dir) sm.setSessionStoragePreference(sessionId, dir as "global" | "local");
             enabled.push("session");
           }
+
           if (!result) {
             result = `Trace enabled (scope: ${enabled.join(", ") || "global"}, storage: ${targetDir})`;
           }
         } else if (cmd === "off" || cmd === "disable") {
           const disabled: string[] = [];
+
           if (hasGlobal || !(hasLocal || hasSession)) {
             sm.setGlobalState("global_trace_enabled", "false");
             disabled.push("global");
           }
+
           if (hasLocal) {
             if (!localCmd) {
               result = "Local config not available";
@@ -252,15 +283,17 @@ const plugin: Plugin = async (input: PluginInput) => {
               disabled.push("local");
             }
           }
-          if (hasSession) {
-            sm.setSessionEnabled(input.sessionId, false);
+
+          if (hasSession && sessionId) {
+            sm.setSessionEnabled(sessionId, false);
             disabled.push("session");
           }
+
           if (!result) {
             result = `Trace disabled (scope: ${disabled.join(", ") || "global"})`;
           }
         } else if (cmd === "status") {
-          result = formatStatus(instance, input.sessionId);
+          result = formatStatus(instance, sessionId);
         } else {
           result = `Unknown command: ${cmd}. Use /trace on, /trace off, or /trace status.`;
         }
@@ -269,18 +302,23 @@ const plugin: Plugin = async (input: PluginInput) => {
       }
 
       try {
-        await client.session.prompt({
-          path: { id: input.sessionId },
-          body: {
-            noReply: true,
-            parts: [{ type: "text", text: result, ignored: true }],
-          },
-        });
+        if (client && typeof client.session?.prompt === "function") {
+          await client.session.prompt({
+            path: { id: sessionId },
+            body: {
+              noReply: true,
+              parts: [{ type: "text", text: result, ignored: true }],
+            },
+          });
+        }
       } catch (err) {
         logger.error("Failed to send trace command response", { error: String(err) });
       }
 
-      _output.parts.length = 0;
+      if (_output && Array.isArray(_output.parts)) {
+        _output.parts.length = 0;
+      }
+
       throw new Error(TRACE_HANDLED);
     },
   };
@@ -288,9 +326,9 @@ const plugin: Plugin = async (input: PluginInput) => {
   return hooks;
 };
 
-const entrypoint: PluginModule = {
+export const entrypoint = {
   id: "ljx1004.opencode-trace",
   server: plugin,
 };
 
-export default entrypoint;
+export default plugin;
